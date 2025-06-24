@@ -665,10 +665,13 @@ async function matchTorrents() {
     hideLoading("matchLoading");
 
     if (response.ok) {
-      matchedTorrents = result.matched;
+      // 为每个匹配的种子添加选择状态，保持后端设置的状态或默认为选中
+      matchedTorrents = result.matched.map(item => ({
+        ...item,
+        selected: item.selected !== undefined ? item.selected : true
+      }));
       displayMatchResults(result);
-      document.getElementById("addTorrentsBtn").disabled =
-        result.matched.length === 0;
+      updateAddButton();
     } else {
       showMessage("matchResults", result.error, "error");
     }
@@ -681,52 +684,17 @@ async function matchTorrents() {
 
 // 显示匹配结果
 function displayMatchResults(result) {
-  const container = document.getElementById("matchResults");
-
-  let html = `
-        <div class="alert alert-info">
-            <h6><i class="bi bi-info-circle"></i> 匹配完成</h6>
-            <p>成功匹配 ${result.matched.length} 个种子，未匹配 ${result.unmatched.length} 个种子</p>
-        </div>
-    `;
-
-  // 显示匹配的种子
-  if (result.matched.length > 0) {
-    html +=
-      '<h6><i class="bi bi-check-circle text-success"></i> 已匹配的种子</h6>';
-    result.matched.forEach((match) => {
-      const similarity = Math.round(match.similarity * 100);
-      html += `
-                <div class="match-item">
-                    <div class="d-flex justify-content-between align-items-center mb-2">
-                        <strong>${match.torrent.name}</strong>
-                        <span class="badge bg-success">${similarity}% 匹配</span>
-                    </div>
-                    <div class="similarity-bar mb-2">
-                        <div class="similarity-fill" style="width: ${similarity}%"></div>
-                    </div>
-                    <small class="text-muted">
-                        匹配文件: ${match.matched_file.category}<br>
-                        下载路径: ${
-                          match.matched_file.new_path
-                            ? match.matched_file.new_path
-                                .split("/")
-                                .slice(0, -1)
-                                .join("/")
-                            : ""
-                        }
-                    </small>
-                </div>
-            `;
-    });
-  }
+  // 使用新的显示逻辑
+  updateMatchDisplay();
 
   // 显示未匹配的种子
   if (result.unmatched.length > 0) {
-    html +=
-      '<h6 class="mt-3"><i class="bi bi-x-circle text-warning"></i> 未匹配的种子</h6>';
+    const container = document.getElementById("matchResults");
+    let currentHtml = container.innerHTML;
+
+    currentHtml += '<h6 class="mt-3"><i class="bi bi-x-circle text-warning"></i> 未匹配的种子</h6>';
     result.unmatched.forEach((torrent) => {
-      html += `
+      currentHtml += `
                 <div class="result-item">
                     <div class="d-flex justify-content-between align-items-center">
                         <div>
@@ -739,6 +707,156 @@ function displayMatchResults(result) {
                 </div>
             `;
     });
+
+    container.innerHTML = currentHtml;
+  }
+}
+
+// 更新添加按钮状态
+function updateAddButton() {
+  const selectedCount = matchedTorrents.filter(item => item.selected).length;
+  const addBtn = document.getElementById("addTorrentsBtn");
+
+  addBtn.disabled = selectedCount === 0;
+  addBtn.innerHTML = `<i class="bi bi-plus-circle"></i> 批量添加种子 (${selectedCount})`;
+}
+
+// 移除种子
+async function removeTorrent(index) {
+  if (index >= 0 && index < matchedTorrents.length) {
+    const match = matchedTorrents[index];
+
+    // 标记为未选择
+    matchedTorrents[index].selected = false;
+
+    // 记录移除的种子信息
+    try {
+      const response = await fetch("/api/remove_torrent", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          torrent_info: match.torrent,
+          matched_info: {
+            name: match.matched_filename,
+            similarity: match.similarity,
+            match_type: match.matched_file.match_type,
+            download_path: match.matched_file.download_path
+          }
+        }),
+      });
+
+      if (response.ok) {
+        console.log("种子移除记录成功");
+      } else {
+        console.warn("种子移除记录失败");
+      }
+    } catch (error) {
+      console.error("记录移除种子失败:", error);
+    }
+
+    updateMatchDisplay();
+    updateAddButton();
+  }
+}
+
+// 恢复种子
+function restoreTorrent(index) {
+  if (index >= 0 && index < matchedTorrents.length) {
+    matchedTorrents[index].selected = true;
+    updateMatchDisplay();
+    updateAddButton();
+  }
+}
+
+// 更新匹配结果显示
+function updateMatchDisplay() {
+  const container = document.getElementById("matchResults");
+  const selectedTorrents = matchedTorrents.filter(item => item.selected);
+  const removedTorrents = matchedTorrents.filter(item => !item.selected);
+
+  // 过滤出需要显示的种子（排除100%匹配的种子）
+  const displayTorrents = selectedTorrents.filter(match => {
+    const similarity = Math.round(match.similarity * 100);
+    return similarity < 100;
+  });
+
+  // 统计100%匹配的种子数量
+  const perfectMatchCount = selectedTorrents.length - displayTorrents.length;
+
+  let html = `
+        <div class="alert alert-info">
+            <h6><i class="bi bi-info-circle"></i> 匹配完成</h6>
+            <p>总计选择 ${selectedTorrents.length} 个种子（其中 ${perfectMatchCount} 个完美匹配，${displayTorrents.length} 个需要确认），已移除 ${removedTorrents.length} 个种子</p>
+        </div>
+    `;
+
+  // 显示已选择的种子（排除100%匹配）
+  if (displayTorrents.length > 0) {
+    html += '<h6><i class="bi bi-check-circle text-success"></i> 已选择的种子（需要确认）</h6>';
+    displayTorrents.forEach((match) => {
+      const originalIndex = matchedTorrents.findIndex(item => item === match);
+      const similarity = Math.round(match.similarity * 100);
+      html += `
+                <div class="match-item">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <strong>${match.torrent.name}</strong>
+                        <div>
+                            <span class="badge bg-success me-2">${similarity}% 匹配</span>
+                            <button class="btn btn-sm btn-outline-danger" onclick="removeTorrent(${originalIndex})" title="移除此种子">
+                                <i class="bi bi-x"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="similarity-bar mb-2">
+                        <div class="similarity-fill" style="width: ${similarity}%"></div>
+                    </div>
+                    <small class="text-muted">
+                        匹配文件夹: <strong>${match.matched_filename || '未知文件夹'}</strong><br>
+                        匹配策略: ${match.matched_file.match_type === 'folder_similar' ? '文件与文件夹相似' : '文件与文件夹不同'}<br>
+                        示例文件: ${match.matched_file.sample_file || '无'} (共${match.matched_file.file_count || 0}个文件)<br>
+                        下载路径: ${match.matched_file.download_path || '未知路径'}
+                    </small>
+                </div>
+            `;
+    });
+  }
+
+  // 显示100%匹配的种子提示
+  if (perfectMatchCount > 0) {
+    html += `
+      <div class="alert alert-success mt-3">
+        <i class="bi bi-check-circle-fill"></i>
+        <strong>${perfectMatchCount} 个种子完美匹配（100%）</strong>，已自动选择，无需手动确认
+      </div>
+    `;
+  }
+
+  // 显示已移除的种子
+  if (removedTorrents.length > 0) {
+    html += '<h6 class="mt-3"><i class="bi bi-x-circle text-muted"></i> 已移除的种子</h6>';
+    removedTorrents.forEach((match) => {
+      const originalIndex = matchedTorrents.findIndex(item => item === match);
+      const similarity = Math.round(match.similarity * 100);
+      html += `
+                <div class="match-item" style="opacity: 0.6;">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <strong>${match.torrent.name}</strong>
+                        <div>
+                            <span class="badge bg-secondary me-2">${similarity}% 匹配</span>
+                            <button class="btn btn-sm btn-outline-success" onclick="restoreTorrent(${originalIndex})" title="恢复此种子">
+                                <i class="bi bi-arrow-counterclockwise"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <small class="text-muted">
+                        匹配文件夹: <strong>${match.matched_filename || '未知文件夹'}</strong><br>
+                        匹配策略: ${match.matched_file.match_type === 'folder_similar' ? '文件与文件夹相似' : '文件与文件夹不同'}
+                    </small>
+                </div>
+            `;
+    });
   }
 
   container.innerHTML = html;
@@ -746,8 +864,10 @@ function displayMatchResults(result) {
 
 // 添加种子到qBittorrent
 async function addTorrents() {
-  if (matchedTorrents.length === 0) {
-    showMessage("addResults", "没有匹配的种子可以添加", "error");
+  const selectedTorrents = matchedTorrents.filter(item => item.selected);
+
+  if (selectedTorrents.length === 0) {
+    showMessage("addResults", "没有选择的种子可以添加", "error");
     return;
   }
 
@@ -760,7 +880,7 @@ async function addTorrents() {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        matched_torrents: matchedTorrents,
+        matched_torrents: selectedTorrents,
       }),
     });
 
@@ -852,7 +972,9 @@ async function resetData() {
       document.getElementById("addResults").innerHTML = "";
       // 禁用按钮
       document.getElementById("processBtn").disabled = true;
-      document.getElementById("addTorrentsBtn").disabled = true;
+      const addBtn = document.getElementById("addTorrentsBtn");
+      addBtn.disabled = true;
+      addBtn.innerHTML = '<i class="bi bi-plus-circle"></i> 批量添加种子';
     } else {
       showMessage("systemResults", result.message, "error");
     }

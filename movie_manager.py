@@ -38,6 +38,7 @@ class MovieManager:
         self.qb_username = None
         self.qb_password = None
         self.processed_files = {}  # 存储已处理的文件路径映射
+        self.removed_torrents = {}  # 存储已移除种子的记录
 
         # 路径配置
         self.movie_path = ""
@@ -420,30 +421,125 @@ tv:
                     data = json.load(f)
 
                 self.processed_files = data.get('processed_files', {})
+                self.removed_torrents = data.get('removed_torrents', {})
 
                 logger.info(f"数据文件加载成功: {self.data_file}")
                 logger.info(f"已处理文件数量: {len(self.processed_files)}")
+                logger.info(f"已移除种子记录数量: {len(self.removed_torrents)}")
             else:
                 logger.info("数据文件不存在，将创建新的数据文件")
         except Exception as e:
             logger.error(f"加载数据文件失败: {e}")
             self.processed_files = {}
+            self.removed_torrents = {}
 
     def save_data(self):
         """保存数据文件"""
         try:
             data = {
                 'processed_files': self.processed_files,
+                'removed_torrents': self.removed_torrents,
                 'last_updated': time.time(),
-                'total_processed': len(self.processed_files)
+                'total_processed': len(self.processed_files),
+                'total_removed_torrents': len(self.removed_torrents)
             }
 
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
-            logger.info(f"数据文件保存成功: {self.data_file}, 已处理文件: {len(self.processed_files)}")
+            logger.info(f"数据文件保存成功: {self.data_file}, 已处理文件: {len(self.processed_files)}, 已移除种子记录: {len(self.removed_torrents)}")
         except Exception as e:
             logger.error(f"保存数据文件失败: {e}")
+
+    def add_removed_torrent_record(self, torrent_info: Dict, matched_info: Dict) -> None:
+        """添加已移除种子的记录"""
+        try:
+            # 创建种子的唯一标识
+            torrent_key = self.generate_torrent_key(torrent_info, matched_info)
+
+            # 记录详细信息
+            record = {
+                'torrent_name': torrent_info.get('name', ''),
+                'torrent_title': torrent_info.get('title', ''),
+                'matched_filename': matched_info.get('name', ''),
+                'similarity': matched_info.get('similarity', 0),
+                'match_type': matched_info.get('match_type', ''),
+                'download_path': matched_info.get('download_path', ''),
+                'removed_time': time.time(),
+                'removed_count': self.removed_torrents.get(torrent_key, {}).get('removed_count', 0) + 1
+            }
+
+            self.removed_torrents[torrent_key] = record
+            logger.info(f"记录已移除种子: {torrent_info.get('name', '')} -> {matched_info.get('name', '')} (相似度: {matched_info.get('similarity', 0):.2f})")
+
+            # 保存数据
+            self.save_data()
+
+        except Exception as e:
+            logger.error(f"记录移除种子失败: {e}")
+
+    def generate_torrent_key(self, torrent_info: Dict, matched_info: Dict) -> str:
+        """生成种子的唯一标识键"""
+        try:
+            # 使用种子标题和匹配文件名生成唯一键
+            torrent_title = torrent_info.get('title', '').lower().strip()
+            matched_name = matched_info.get('name', '').lower().strip()
+            similarity = round(matched_info.get('similarity', 0), 2)
+
+            # 创建组合键
+            key = f"{torrent_title}|{matched_name}|{similarity}"
+            return key
+
+        except Exception as e:
+            logger.error(f"生成种子键失败: {e}")
+            return f"unknown_{time.time()}"
+
+    def is_torrent_removed(self, torrent_info: Dict, matched_info: Dict) -> bool:
+        """检查种子是否已被记录为移除"""
+        try:
+            torrent_key = self.generate_torrent_key(torrent_info, matched_info)
+            return torrent_key in self.removed_torrents
+
+        except Exception as e:
+            logger.error(f"检查种子移除状态失败: {e}")
+            return False
+
+    def apply_removed_torrent_records(self, matched_torrents: List[Dict]) -> None:
+        """应用已移除种子记录，自动标记匹配的种子为移除状态"""
+        try:
+            auto_removed_count = 0
+
+            for match in matched_torrents:
+                torrent_info = match.get('torrent', {})
+                matched_file_info = {
+                    'name': match.get('matched_filename', ''),
+                    'similarity': match.get('similarity', 0),
+                    'match_type': match.get('matched_file', {}).get('match_type', ''),
+                    'download_path': match.get('matched_file', {}).get('download_path', '')
+                }
+
+                # 检查是否在已移除记录中
+                if self.is_torrent_removed(torrent_info, matched_file_info):
+                    match['selected'] = False  # 标记为未选择（即移除状态）
+                    auto_removed_count += 1
+
+                    # 更新移除记录的计数
+                    torrent_key = self.generate_torrent_key(torrent_info, matched_file_info)
+                    if torrent_key in self.removed_torrents:
+                        self.removed_torrents[torrent_key]['removed_count'] += 1
+                        self.removed_torrents[torrent_key]['last_auto_removed'] = time.time()
+
+                    logger.info(f"自动移除种子（基于历史记录）: {torrent_info.get('name', '')} -> {matched_file_info.get('name', '')}")
+                else:
+                    match['selected'] = True  # 默认选择
+
+            if auto_removed_count > 0:
+                logger.info(f"基于历史记录自动移除了 {auto_removed_count} 个种子")
+                # 保存更新的数据
+                self.save_data()
+
+        except Exception as e:
+            logger.error(f"应用移除种子记录失败: {e}")
 
     def scan_directory(self, path: str, exclude_dirs: List[str] = None) -> Dict:
         """扫描目录下的所有文件和文件夹（只扫描第一层）"""
@@ -752,7 +848,7 @@ tv:
         return name
 
     def extract_title_from_torrent_filename(self, filename: str) -> str:
-        """从种子文件名中提取影视作品标题（特殊处理）"""
+        """从种子文件名中提取影视作品标题（简化处理）"""
         # 移除文件扩展名
         name = os.path.splitext(filename)[0]
         original_name = name
@@ -760,7 +856,6 @@ tv:
         logger.debug(f"开始提取种子标题: {filename}")
 
         # 种子文件特殊预处理：去除第一个中括号及其后面的点
-        # 1. 去除第一个中括号及其内容，以及紧跟着的点
         bracket_match = re.search(r'^\[([^\]]+)\]\.?', name)
         if bracket_match:
             # 移除第一个中括号及其内容，以及可能紧跟的点
@@ -772,11 +867,11 @@ tv:
             logger.warning(f"种子预处理后标题太短，使用原始文件名: {original_name}")
             name = original_name
 
-        # 2. 使用标准的标题提取规则处理剩余内容
-        extracted_title = self.extract_title_from_filename(name + ".dummy")  # 添加假扩展名避免影响处理
+        # 简单清理：移除多余的空格
+        name = re.sub(r'\s+', ' ', name).strip()
 
-        logger.info(f"种子标题提取完成: '{filename}' -> '{extracted_title}'")
-        return extracted_title
+        logger.info(f"种子标题提取完成: '{filename}' -> '{name}'")
+        return name
 
     def create_category_folder(self, base_path: str, category_name: str) -> str:
         """创建类目文件夹"""
@@ -861,12 +956,92 @@ tv:
 
         return torrent_files
 
+    def scan_all_movie_files(self, movie_path: str) -> List[Dict]:
+        """扫描影视文件夹下的所有文件，分析文件与父文件夹的关系"""
+        match_candidates = []
+
+        if not movie_path or not os.path.exists(movie_path):
+            logger.warning(f"影视文件夹路径无效: {movie_path}")
+            return match_candidates
+
+        logger.info(f"开始扫描影视文件夹: {movie_path}")
+
+        try:
+            for root, dirs, files in os.walk(movie_path):
+                # 只处理影视文件（常见的视频文件扩展名）
+                video_extensions = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.m2ts', '.rmvb', '.rm', '.3gp', '.f4v'}
+                video_files = [f for f in files if os.path.splitext(f.lower())[1] in video_extensions]
+
+                if video_files:
+                    # 获取当前目录信息
+                    current_dir = root
+                    parent_dir_name = os.path.basename(current_dir)
+                    grandparent_dir = os.path.dirname(current_dir)
+
+                    # 跳过根目录（影视文件夹本身）
+                    if current_dir == movie_path:
+                        continue
+
+                    # 分析第一个视频文件与父文件夹的相似性
+                    first_video = video_files[0]
+                    # 直接使用原始文件名和文件夹名，不进行复杂的标题提取
+                    file_name_clean = os.path.splitext(first_video)[0].lower()  # 去除扩展名
+                    folder_name_clean = parent_dir_name.lower()
+
+                    # 计算相似度
+                    similarity = SequenceMatcher(None, file_name_clean, folder_name_clean).ratio()
+
+                    logger.debug(f"分析文件夹: {parent_dir_name}")
+                    logger.debug(f"  第一个文件: {first_video}")
+                    logger.debug(f"  文件名(去扩展名): {file_name_clean}")
+                    logger.debug(f"  文件夹名: {folder_name_clean}")
+                    logger.debug(f"  相似度: {similarity:.2f}")
+
+                    # 根据相似性确定匹配策略
+                    if similarity > 0.6:  # 文件名与父文件夹相似
+                        # 匹配父文件夹名称，下载到父文件夹的父目录
+                        download_path = grandparent_dir
+                        match_type = "folder_similar"
+                        logger.debug(f"  策略: 文件与文件夹相似，下载到父目录: {download_path}")
+                    else:  # 文件名与父文件夹不相似
+                        # 匹配父文件夹名称，下载到父文件夹内
+                        download_path = current_dir
+                        match_type = "folder_different"
+                        logger.debug(f"  策略: 文件与文件夹不相似，下载到文件夹内: {download_path}")
+
+                    # 创建匹配候选项
+                    match_candidates.append({
+                        'name': parent_dir_name,  # 用于匹配的名称（父文件夹名）
+                        'path': current_dir,      # 文件夹路径
+                        'download_path': download_path,  # 下载路径
+                        'type': 'folder_match',
+                        'match_type': match_type,
+                        'similarity_with_file': similarity,
+                        'sample_file': first_video,
+                        'file_count': len(video_files)
+                    })
+
+        except Exception as e:
+            logger.error(f"扫描影视文件夹异常: {e}")
+
+        logger.info(f"扫描完成，找到 {len(match_candidates)} 个匹配候选项")
+        return match_candidates
+
     def match_torrents_with_files(self, torrent_files: List[Dict]) -> Dict:
-        """匹配种子文件与已处理的影视文件"""
+        """匹配种子文件与影视文件夹下的所有文件"""
         matched = []
         unmatched = []
 
-        logger.info(f"开始匹配种子文件: {len(torrent_files)} 个种子, {len(self.processed_files)} 个已处理文件")
+        # 获取影视文件夹路径
+        movie_path = getattr(self, 'movie_path', '')
+        if not movie_path:
+            logger.error("影视文件夹路径未配置，无法进行匹配")
+            return {'matched': [], 'unmatched': torrent_files}
+
+        # 扫描影视文件夹下的所有文件，获取匹配候选项
+        match_candidates = self.scan_all_movie_files(movie_path)
+
+        logger.info(f"开始匹配种子文件: {len(torrent_files)} 个种子, {len(match_candidates)} 个匹配候选项")
 
         for torrent in torrent_files:
             torrent_title = torrent['title'].lower()
@@ -874,27 +1049,45 @@ tv:
             best_match = None
             best_score = 0
             best_filename = ""
+            best_candidate = None
 
             logger.debug(f"匹配种子: {torrent_name} -> 提取标题: {torrent['title']}")
 
-            # 与已处理的文件进行匹配
-            for filename, file_info in self.processed_files.items():
-                # 提取文件标题进行比较
-                file_title = self.extract_title_from_filename(filename).lower()
+            # 与所有匹配候选项进行匹配
+            for candidate in match_candidates:
+                folder_name = candidate['name']
+                # 直接比较种子标题与原始文件夹名，不使用复杂的标题提取
+                folder_name_lower = folder_name.lower()
 
-                # 计算相似度
-                similarity = SequenceMatcher(None, torrent_title, file_title).ratio()
+                # 计算相似度（种子标题已经是简化处理后的）
+                similarity = SequenceMatcher(None, torrent_title, folder_name_lower).ratio()
+
+                logger.debug(f"  候选项: {folder_name} (相似度: {similarity:.2f}, 类型: {candidate['match_type']})")
 
                 if similarity > best_score and similarity > 0.6:  # 相似度阈值
                     best_score = similarity
-                    best_match = file_info
-                    best_filename = filename
+                    best_match = candidate
+                    best_filename = folder_name
+                    best_candidate = candidate
 
             if best_match:
-                logger.info(f"种子匹配成功: {torrent_name} -> {best_filename} (相似度: {best_score:.2f})")
+                logger.info(f"种子匹配成功: {torrent_name} -> {best_filename} (相似度: {best_score:.2f}, 策略: {best_candidate['match_type']})")
+
+                # 构建匹配文件信息
+                matched_file_info = {
+                    'name': best_filename,
+                    'path': best_candidate['path'],
+                    'download_path': best_candidate['download_path'],
+                    'type': 'folder_match',
+                    'match_type': best_candidate['match_type'],
+                    'sample_file': best_candidate['sample_file'],
+                    'file_count': best_candidate['file_count']
+                }
+
                 matched.append({
                     'torrent': torrent,
-                    'matched_file': best_match,
+                    'matched_file': matched_file_info,
+                    'matched_filename': best_filename,
                     'similarity': best_score
                 })
             else:
@@ -902,6 +1095,16 @@ tv:
                 unmatched.append(torrent)
 
         logger.info(f"种子匹配完成 - 匹配成功: {len(matched)}, 未匹配: {len(unmatched)}")
+
+        # 检查已移除种子记录，自动标记为移除
+        self.apply_removed_torrent_records(matched)
+
+        # 重新统计应用移除记录后的结果
+        selected_count = len([m for m in matched if m.get('selected', True)])
+        removed_count = len([m for m in matched if not m.get('selected', True)])
+
+        logger.info(f"应用移除记录后 - 总匹配: {len(matched)}, 已选择: {selected_count}, 已移除: {removed_count}, 未匹配: {len(unmatched)}")
+
         return {
             'matched': matched,
             'unmatched': unmatched
@@ -926,6 +1129,10 @@ tv:
             if response.text == "Ok.":
                 self.qb_cookies = response.cookies
                 logger.info("qBittorrent登录成功")
+
+                # 检查并创建分类
+                self.qb_ensure_category()
+
                 return True
             else:
                 logger.error("qBittorrent登录失败")
@@ -935,14 +1142,66 @@ tv:
             logger.error(f"qBittorrent登录异常: {e}")
             return False
 
+    def qb_ensure_category(self) -> bool:
+        """确保movie_manager分类存在"""
+        try:
+            # 获取现有分类
+            categories_url = f"{self.qb_host}/api/v2/torrents/categories"
+            response = requests.get(categories_url, cookies=self.qb_cookies, timeout=10)
+            response.raise_for_status()
+
+            categories = response.json()
+
+            if 'movie_manager' not in categories:
+                # 创建分类
+                create_url = f"{self.qb_host}/api/v2/torrents/createCategory"
+                data = {
+                    'category': 'movie_manager',
+                    'savePath': ''  # 使用默认路径
+                }
+
+                response = requests.post(create_url, data=data, cookies=self.qb_cookies, timeout=10)
+                response.raise_for_status()
+
+                if response.text == "Ok." or response.status_code == 200:
+                    logger.info("成功创建qBittorrent分类: movie_manager")
+                    return True
+                else:
+                    logger.warning(f"创建分类失败: {response.text}")
+                    return False
+            else:
+                logger.debug("qBittorrent分类movie_manager已存在")
+                return True
+
+        except Exception as e:
+            logger.warning(f"检查/创建qBittorrent分类异常: {e}")
+            return False
+
     def qb_add_torrent(self, torrent_path: str, download_path: str) -> bool:
         """添加种子到qBittorrent"""
         try:
+            # 检查种子文件是否存在
+            if not os.path.exists(torrent_path):
+                logger.error(f"种子文件不存在: {torrent_path}")
+                return False
+
+            # 检查种子文件大小
+            file_size = os.path.getsize(torrent_path)
+            if file_size == 0:
+                logger.error(f"种子文件为空: {torrent_path}")
+                return False
+
+            logger.debug(f"种子文件检查通过: {torrent_path} (大小: {file_size} 字节)")
+
             if not hasattr(self, 'qb_cookies'):
                 if not self.qb_login():
+                    logger.error("qBittorrent登录失败，无法添加种子")
                     return False
 
             add_url = f"{self.qb_host}/api/v2/torrents/add"
+
+            # 检查下载路径
+            logger.debug(f"目标下载路径: {download_path}")
 
             with open(torrent_path, 'rb') as f:
                 files = {'torrents': f}
@@ -952,6 +1211,9 @@ tv:
                     'tags': 'auto_added'
                 }
 
+                logger.debug(f"发送请求到qBittorrent: {add_url}")
+                logger.debug(f"请求数据: {data}")
+
                 response = requests.post(
                     add_url,
                     files=files,
@@ -959,15 +1221,35 @@ tv:
                     cookies=self.qb_cookies,
                     timeout=30
                 )
+
+                logger.debug(f"qBittorrent响应状态码: {response.status_code}")
+                logger.debug(f"qBittorrent响应内容: {response.text}")
+
                 response.raise_for_status()
 
                 if response.text == "Ok.":
                     logger.info(f"成功添加种子: {torrent_path}")
                     return True
                 else:
-                    logger.error(f"添加种子失败: {response.text}")
+                    # 详细的错误分析
+                    error_msg = response.text.strip()
+                    if error_msg == "Fails.":
+                        logger.error(f"添加种子失败 - 可能原因:")
+                        logger.error(f"  1. 下载路径不存在或无权限: {download_path}")
+                        logger.error(f"  2. 种子文件已存在于qBittorrent中")
+                        logger.error(f"  3. 种子文件格式错误或损坏")
+                        logger.error(f"  4. qBittorrent分类'movie_manager'不存在")
+                        logger.error(f"  5. 磁盘空间不足")
+                    else:
+                        logger.error(f"添加种子失败: {error_msg}")
                     return False
 
+        except requests.exceptions.RequestException as e:
+            logger.error(f"网络请求异常: {e}")
+            return False
+        except FileNotFoundError as e:
+            logger.error(f"种子文件未找到: {e}")
+            return False
         except Exception as e:
             logger.error(f"添加种子异常: {e}")
             return False
@@ -1159,6 +1441,31 @@ def api_match_torrents():
 
     return jsonify(match_result)
 
+@app.route('/api/remove_torrent', methods=['POST'])
+def api_remove_torrent():
+    """移除种子并记录API"""
+    data = request.get_json()
+
+    torrent_info = data.get('torrent_info', {})
+    matched_info = data.get('matched_info', {})
+
+    logger.info(f"API请求 - 移除种子: {torrent_info.get('name', '')}")
+
+    if not torrent_info or not matched_info:
+        logger.warning("移除种子API - 参数不完整")
+        return jsonify({'error': '参数不完整'}), 400
+
+    try:
+        # 记录移除的种子
+        movie_manager.add_removed_torrent_record(torrent_info, matched_info)
+
+        logger.info(f"种子移除记录成功: {torrent_info.get('name', '')}")
+        return jsonify({'status': 'success', 'message': '种子已移除并记录'})
+
+    except Exception as e:
+        logger.error(f"移除种子记录失败: {e}")
+        return jsonify({'status': 'error', 'message': f'移除失败: {str(e)}'}), 500
+
 @app.route('/api/config_qb', methods=['POST'])
 def api_config_qb():
     """配置qBittorrent API"""
@@ -1288,9 +1595,12 @@ def api_add_torrents():
 
         torrent_name = torrent_info.get('name', 'Unknown')
         torrent_path = torrent_info.get('path')
-        download_path = os.path.dirname(matched_file.get('new_path', ''))
 
-        logger.info(f"处理种子: {torrent_name} -> {download_path}")
+        # 使用智能确定的下载路径
+        download_path = matched_file.get('download_path', '')
+        match_type = matched_file.get('match_type', 'unknown')
+
+        logger.info(f"处理种子: {torrent_name} -> {download_path} (策略: {match_type})")
 
         if torrent_path and download_path:
             success = movie_manager.qb_add_torrent(torrent_path, download_path)
@@ -1304,6 +1614,7 @@ def api_add_torrents():
             results.append({
                 'torrent_name': torrent_name,
                 'download_path': download_path,
+                'match_type': match_type,
                 'status': 'success' if success else 'error'
             })
         else:
