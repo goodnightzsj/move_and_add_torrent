@@ -17,7 +17,11 @@ import re
 import time
 import hashlib
 import base64
+import random
+import string
+import threading
 from difflib import SequenceMatcher
+from datetime import datetime, timedelta
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,6 +58,17 @@ class MovieManager:
 
         # 分类配置
         self.category_config = self.load_category_config()
+
+        # 高级功能配置
+        self.skip_verify = False  # 跳过校验
+        self.auto_start = True    # 自动开始
+        self.monitor_interval = 30  # 状态监控间隔（秒）
+        self.enable_monitoring = False  # 启用状态监控
+
+        # 种子状态跟踪
+        self.pending_torrents = {}  # 待校验的种子 {hash: {tag, add_time, path}}
+        self.monitoring_thread = None
+        self.monitoring_stop_event = threading.Event()
 
         # 加载配置和数据
         self.load_config()
@@ -384,9 +399,17 @@ tv:
                 self.exclude_dirs = config.get('exclude_dirs', [])
                 self.torrent_path = config.get('torrent_path', '')
 
+                # 加载高级功能配置
+                self.skip_verify = config.get('skip_verify', False)
+                self.auto_start = config.get('auto_start', True)
+                self.monitor_interval = config.get('monitor_interval', 30)
+                self.enable_monitoring = config.get('enable_monitoring', False)
+
                 logger.info(f"配置文件加载成功: {self.config_file}")
                 logger.info(f"TMDB API: {'已配置' if self.tmdb_api_key else '未配置'}")
                 logger.info(f"qBittorrent: {'已配置' if self.qb_host else '未配置'}")
+                logger.info(f"高级功能: 跳过校验={'开启' if self.skip_verify else '关闭'}, "
+                           f"状态监控={'开启' if self.enable_monitoring else '关闭'}")
             else:
                 logger.info("配置文件不存在，等待用户首次配置")
         except Exception as e:
@@ -403,6 +426,10 @@ tv:
                 'movie_path': self.movie_path,
                 'exclude_dirs': self.exclude_dirs,
                 'torrent_path': self.torrent_path,
+                'skip_verify': self.skip_verify,
+                'auto_start': self.auto_start,
+                'monitor_interval': self.monitor_interval,
+                'enable_monitoring': self.enable_monitoring,
                 'last_updated': time.time()
             }
 
@@ -966,6 +993,18 @@ tv:
 
         logger.info(f"开始扫描影视文件夹: {movie_path}")
 
+        # 预处理：获取影视目录的直接子目录名称
+        direct_subdirs = set()
+        try:
+            for item in os.listdir(movie_path):
+                item_path = os.path.join(movie_path, item)
+                if os.path.isdir(item_path):
+                    direct_subdirs.add(item)
+            logger.info(f"影视目录直接子目录: {list(direct_subdirs)} (共{len(direct_subdirs)}个)")
+        except Exception as e:
+            logger.error(f"获取直接子目录失败: {e}")
+            direct_subdirs = set()
+
         try:
             for root, dirs, files in os.walk(movie_path):
                 # 只处理影视文件（常见的视频文件扩展名）
@@ -1009,22 +1048,56 @@ tv:
                         match_type = "folder_different"
                         logger.debug(f"  策略: 文件与文件夹不相似，下载到文件夹内: {download_path}")
 
-                    # 创建匹配候选项
-                    match_candidates.append({
-                        'name': parent_dir_name,  # 用于匹配的名称（父文件夹名）
-                        'path': current_dir,      # 文件夹路径
-                        'download_path': download_path,  # 下载路径
-                        'type': 'folder_match',
-                        'match_type': match_type,
-                        'similarity_with_file': similarity,
-                        'sample_file': first_video,
-                        'file_count': len(video_files)
-                    })
+                    # 关键判断：检查当前文件夹是否为影视目录的直接子目录
+                    if parent_dir_name in direct_subdirs:
+                        # 文件夹是直接子目录，使用文件名进行匹配
+                        for video_file in video_files:
+                            file_name_without_ext = os.path.splitext(video_file)[0]
+                            logger.debug(f"  → 直接子目录，添加文件名: {file_name_without_ext}")
+                            match_candidates.append({
+                                'name': file_name_without_ext,  # 用于匹配的名称（文件名，去扩展名）
+                                'path': current_dir,            # 文件夹路径
+                                'download_path': download_path, # 下载路径
+                                'type': 'file_match',
+                                'match_type': match_type,
+                                'similarity_with_file': similarity,
+                                'sample_file': video_file,
+                                'file_count': len(video_files),
+                                'parent_folder': parent_dir_name
+                            })
+                    else:
+                        # 文件夹不是直接子目录，使用文件夹名进行匹配（保持原逻辑）
+                        logger.debug(f"  → 非直接子目录，添加文件夹名: {parent_dir_name}")
+                        match_candidates.append({
+                            'name': parent_dir_name,        # 用于匹配的名称（父文件夹名）
+                            'path': current_dir,            # 文件夹路径
+                            'download_path': download_path, # 下载路径
+                            'type': 'folder_match',
+                            'match_type': match_type,
+                            'similarity_with_file': similarity,
+                            'sample_file': first_video,
+                            'file_count': len(video_files)
+                        })
 
         except Exception as e:
             logger.error(f"扫描影视文件夹异常: {e}")
 
         logger.info(f"扫描完成，找到 {len(match_candidates)} 个匹配候选项")
+
+        # 记录子目录集合和所有文件列表
+        logger.info("=" * 60)
+        logger.info(f"影视目录直接子目录集合: {sorted(list(direct_subdirs))}")
+
+        # 收集所有文件名
+        all_files = []
+        for candidate in match_candidates:
+            if candidate['type'] == 'file_match':
+                all_files.append(candidate['name'])
+            else:  # folder_match
+                all_files.append(f"[文件夹] {candidate['name']}")
+
+        logger.info(f"所有文件列表 ({len(all_files)} 个): {all_files}")
+        logger.info("=" * 60)
         return match_candidates
 
     def match_torrents_with_files(self, torrent_files: List[Dict]) -> Dict:
@@ -1110,6 +1183,45 @@ tv:
             'unmatched': unmatched
         }
 
+    def generate_random_tag(self, length: int = 10) -> str:
+        """生成随机标签"""
+        return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+    def qb_get_torrents(self, filter_type: str = "all") -> List[Dict]:
+        """获取种子列表"""
+        try:
+            if not hasattr(self, 'qb_cookies'):
+                if not self.qb_login():
+                    logger.error("qBittorrent登录失败，无法获取种子列表")
+                    return []
+
+            torrents_url = f"{self.qb_host}/api/v2/torrents/info"
+            params = {'filter': filter_type}
+
+            response = requests.get(torrents_url, params=params, cookies=self.qb_cookies, timeout=10)
+            response.raise_for_status()
+
+            return response.json()
+
+        except Exception as e:
+            logger.error(f"获取种子列表失败: {e}")
+            return []
+
+    def qb_get_torrent_by_tag(self, tag: str) -> Optional[Dict]:
+        """通过标签获取种子信息"""
+        try:
+            torrents = self.qb_get_torrents()
+            for torrent in torrents:
+                torrent_tags = torrent.get('tags', '').split(',')
+                torrent_tags = [t.strip() for t in torrent_tags if t.strip()]
+                if tag in torrent_tags:
+                    return torrent
+            return None
+
+        except Exception as e:
+            logger.error(f"通过标签获取种子失败: {e}")
+            return None
+
     def qb_login(self) -> bool:
         """登录qBittorrent"""
         if not all([self.qb_host, self.qb_username, self.qb_password]):
@@ -1177,8 +1289,16 @@ tv:
             logger.warning(f"检查/创建qBittorrent分类异常: {e}")
             return False
 
-    def qb_add_torrent(self, torrent_path: str, download_path: str) -> bool:
-        """添加种子到qBittorrent"""
+    def qb_add_torrent(self, torrent_path: str, download_path: str,
+                      skip_verify: Optional[bool] = None, auto_start: Optional[bool] = None) -> bool:
+        """添加种子到qBittorrent
+
+        Args:
+            torrent_path: 种子文件路径
+            download_path: 下载路径
+            skip_verify: 是否跳过校验（None时使用全局配置）
+            auto_start: 是否自动开始（None时使用全局配置）
+        """
         try:
             # 检查种子文件是否存在
             if not os.path.exists(torrent_path):
@@ -1200,15 +1320,26 @@ tv:
 
             add_url = f"{self.qb_host}/api/v2/torrents/add"
 
+            # 使用参数或全局配置
+            skip_verify = skip_verify if skip_verify is not None else self.skip_verify
+            auto_start = auto_start if auto_start is not None else self.auto_start
+
+            # 生成随机标签用于跟踪
+            random_tag = self.generate_random_tag()
+            tags = f'auto_added,{random_tag}'
+
             # 检查下载路径
             logger.debug(f"目标下载路径: {download_path}")
+            logger.debug(f"校验设置: 跳过校验={skip_verify}, 自动开始={auto_start}")
 
             with open(torrent_path, 'rb') as f:
                 files = {'torrents': f}
                 data = {
                     'savepath': download_path,
                     'category': 'movie_manager',
-                    'tags': 'auto_added'
+                    'tags': tags,
+                    'paused': 'true',  # 默认暂停状态
+                    'skip_checking': 'true' if skip_verify else 'false'
                 }
 
                 logger.debug(f"发送请求到qBittorrent: {add_url}")
@@ -1229,6 +1360,21 @@ tv:
 
                 if response.text == "Ok.":
                     logger.info(f"成功添加种子: {torrent_path}")
+
+                    # 添加到待处理队列
+                    self.pending_torrents[random_tag] = {
+                        'tag': random_tag,
+                        'add_time': datetime.now(),
+                        'path': torrent_path,
+                        'download_path': download_path,
+                        'skip_verify': skip_verify,
+                        'auto_start': auto_start
+                    }
+
+                    # 启动监控（如果启用）
+                    if self.enable_monitoring and not self.monitoring_thread:
+                        self.start_monitoring()
+
                     return True
                 else:
                     # 详细的错误分析
@@ -1253,6 +1399,133 @@ tv:
         except Exception as e:
             logger.error(f"添加种子异常: {e}")
             return False
+
+    def qb_start_torrents(self, hashes: List[str]) -> bool:
+        """启动种子"""
+        try:
+            if not hasattr(self, 'qb_cookies'):
+                if not self.qb_login():
+                    return False
+
+            start_url = f"{self.qb_host}/api/v2/torrents/resume"
+            data = {'hashes': '|'.join(hashes)}
+
+            response = requests.post(start_url, data=data, cookies=self.qb_cookies, timeout=10)
+            response.raise_for_status()
+
+            return response.text == "Ok." or response.status_code == 200
+
+        except Exception as e:
+            logger.error(f"启动种子失败: {e}")
+            return False
+
+    def qb_recheck_torrents(self, hashes: List[str]) -> bool:
+        """重新校验种子"""
+        try:
+            if not hasattr(self, 'qb_cookies'):
+                if not self.qb_login():
+                    return False
+
+            recheck_url = f"{self.qb_host}/api/v2/torrents/recheck"
+            data = {'hashes': '|'.join(hashes)}
+
+            response = requests.post(recheck_url, data=data, cookies=self.qb_cookies, timeout=10)
+            response.raise_for_status()
+
+            return response.text == "Ok." or response.status_code == 200
+
+        except Exception as e:
+            logger.error(f"重新校验种子失败: {e}")
+            return False
+
+    def start_monitoring(self):
+        """启动状态监控"""
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            logger.warning("状态监控已在运行")
+            return
+
+        self.monitoring_stop_event.clear()
+        self.monitoring_thread = threading.Thread(target=self._monitoring_worker, daemon=True)
+        self.monitoring_thread.start()
+        logger.info("状态监控已启动")
+
+    def stop_monitoring(self):
+        """停止状态监控"""
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            self.monitoring_stop_event.set()
+            self.monitoring_thread.join(timeout=5)
+            logger.info("状态监控已停止")
+
+    def _monitoring_worker(self):
+        """状态监控工作线程"""
+        logger.info(f"状态监控线程启动，检查间隔: {self.monitor_interval}秒")
+
+        while not self.monitoring_stop_event.is_set():
+            try:
+                self._check_pending_torrents()
+            except Exception as e:
+                logger.error(f"状态监控异常: {e}")
+
+            # 等待指定间隔或停止信号
+            self.monitoring_stop_event.wait(self.monitor_interval)
+
+        logger.info("状态监控线程已退出")
+
+    def _check_pending_torrents(self):
+        """检查待处理种子状态"""
+        if not self.pending_torrents:
+            return
+
+        completed_tags = []
+
+        for tag, info in self.pending_torrents.items():
+            try:
+                torrent = self.qb_get_torrent_by_tag(tag)
+                if not torrent:
+                    # 种子可能被删除或标签丢失
+                    logger.warning(f"未找到标签为 {tag} 的种子")
+                    completed_tags.append(tag)
+                    continue
+
+                state = torrent.get('state', '')
+                progress = torrent.get('progress', 0)
+
+                logger.debug(f"种子 {tag} 状态: {state}, 进度: {progress:.2%}")
+
+                # 检查是否可以开始做种
+                if state in ['pausedUP', 'stoppedUP'] and progress >= 1.0:
+                    # 校验完成且完整
+                    if info['auto_start']:
+                        torrent_hash = torrent.get('hash')
+                        if self.qb_start_torrents([torrent_hash]):
+                            logger.info(f"自动启动种子: {info['path']}")
+                        else:
+                            logger.error(f"启动种子失败: {info['path']}")
+                    else:
+                        logger.info(f"种子校验完成，等待手动启动: {info['path']}")
+
+                    completed_tags.append(tag)
+
+                elif state in ['error', 'missingFiles']:
+                    # 种子出错
+                    logger.error(f"种子状态异常: {info['path']}, 状态: {state}")
+                    completed_tags.append(tag)
+
+                # 检查超时（24小时）
+                elif datetime.now() - info['add_time'] > timedelta(hours=24):
+                    logger.warning(f"种子处理超时: {info['path']}")
+                    completed_tags.append(tag)
+
+            except Exception as e:
+                logger.error(f"检查种子 {tag} 状态失败: {e}")
+                completed_tags.append(tag)
+
+        # 清理已完成的种子
+        for tag in completed_tags:
+            self.pending_torrents.pop(tag, None)
+
+        if completed_tags:
+            logger.info(f"清理了 {len(completed_tags)} 个已完成的种子跟踪记录")
 
 # 创建全局实例
 movie_manager = MovieManager()
@@ -1523,7 +1796,11 @@ def handle_config():
             'qb_password': movie_manager.qb_password or '',
             'movie_path': movie_manager.movie_path or '',
             'exclude_dirs': movie_manager.exclude_dirs or [],
-            'torrent_path': movie_manager.torrent_path or ''
+            'torrent_path': movie_manager.torrent_path or '',
+            'skip_verify': movie_manager.skip_verify,
+            'auto_start': movie_manager.auto_start,
+            'monitor_interval': movie_manager.monitor_interval,
+            'enable_monitoring': movie_manager.enable_monitoring
         }
         return jsonify({
             'status': 'success',
@@ -1548,6 +1825,21 @@ def handle_config():
             movie_manager.exclude_dirs = data['exclude_dirs']
         if 'torrent_path' in data:
             movie_manager.torrent_path = data['torrent_path']
+        if 'skip_verify' in data:
+            movie_manager.skip_verify = data['skip_verify']
+        if 'auto_start' in data:
+            movie_manager.auto_start = data['auto_start']
+        if 'monitor_interval' in data:
+            movie_manager.monitor_interval = max(10, int(data['monitor_interval']))  # 最小10秒
+        if 'enable_monitoring' in data:
+            old_monitoring = movie_manager.enable_monitoring
+            movie_manager.enable_monitoring = data['enable_monitoring']
+
+            # 处理监控状态变化
+            if movie_manager.enable_monitoring and not old_monitoring:
+                movie_manager.start_monitoring()
+            elif not movie_manager.enable_monitoring and old_monitoring:
+                movie_manager.stop_monitoring()
 
         movie_manager.save_config()
         return jsonify({'status': 'success', 'message': '配置保存成功'})
@@ -1583,7 +1875,12 @@ def api_add_torrents():
     data = request.get_json()
     matched_torrents = data.get('matched_torrents', [])
 
+    # 获取高级功能参数
+    skip_verify = data.get('skip_verify', None)  # None表示使用全局配置
+    auto_start = data.get('auto_start', None)
+
     logger.info(f"API请求 - 批量添加种子: {len(matched_torrents)} 个种子")
+    logger.info(f"高级参数 - 跳过校验: {skip_verify}, 自动开始: {auto_start}")
 
     results = []
     success_count = 0
@@ -1603,7 +1900,7 @@ def api_add_torrents():
         logger.info(f"处理种子: {torrent_name} -> {download_path} (策略: {match_type})")
 
         if torrent_path and download_path:
-            success = movie_manager.qb_add_torrent(torrent_path, download_path)
+            success = movie_manager.qb_add_torrent(torrent_path, download_path, skip_verify, auto_start)
             if success:
                 success_count += 1
                 logger.info(f"种子添加成功: {torrent_name}")
@@ -1650,6 +1947,74 @@ def api_get_config_status():
                 f"已处理文件={status['processed_files_count']}")
 
     return jsonify(status)
+
+@app.route('/api/torrent_status')
+def api_get_torrent_status():
+    """获取种子状态信息"""
+    try:
+        # 获取待处理种子信息
+        pending_info = []
+        for tag, info in movie_manager.pending_torrents.items():
+            torrent = movie_manager.qb_get_torrent_by_tag(tag)
+            pending_info.append({
+                'tag': tag,
+                'path': info['path'],
+                'download_path': info['download_path'],
+                'add_time': info['add_time'].isoformat(),
+                'skip_verify': info['skip_verify'],
+                'auto_start': info['auto_start'],
+                'torrent_info': {
+                    'state': torrent.get('state', 'unknown') if torrent else 'not_found',
+                    'progress': torrent.get('progress', 0) if torrent else 0,
+                    'name': torrent.get('name', '') if torrent else ''
+                } if torrent else None
+            })
+
+        # 获取监控状态
+        monitoring_status = {
+            'enabled': movie_manager.enable_monitoring,
+            'running': movie_manager.monitoring_thread and movie_manager.monitoring_thread.is_alive(),
+            'interval': movie_manager.monitor_interval,
+            'pending_count': len(movie_manager.pending_torrents)
+        }
+
+        return jsonify({
+            'status': 'success',
+            'monitoring': monitoring_status,
+            'pending_torrents': pending_info
+        })
+
+    except Exception as e:
+        logger.error(f"获取种子状态失败: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/monitoring_control', methods=['POST'])
+def api_monitoring_control():
+    """控制状态监控"""
+    try:
+        data = request.get_json()
+        action = data.get('action')
+
+        if action == 'start':
+            if not movie_manager.enable_monitoring:
+                return jsonify({'status': 'error', 'message': '监控功能未启用'}), 400
+            movie_manager.start_monitoring()
+            return jsonify({'status': 'success', 'message': '监控已启动'})
+
+        elif action == 'stop':
+            movie_manager.stop_monitoring()
+            return jsonify({'status': 'success', 'message': '监控已停止'})
+
+        elif action == 'check_now':
+            movie_manager._check_pending_torrents()
+            return jsonify({'status': 'success', 'message': '立即检查完成'})
+
+        else:
+            return jsonify({'status': 'error', 'message': '无效的操作'}), 400
+
+    except Exception as e:
+        logger.error(f"控制监控失败: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/reset_data', methods=['POST'])
 def api_reset_data():
@@ -1707,9 +2072,15 @@ if __name__ == '__main__':
     logger.info("3. 自动分类和移动文件")
     logger.info("4. 匹配种子文件")
     logger.info("5. qBittorrent自动下载")
+    logger.info("6. 智能校验控制和状态监控")
     logger.info("=" * 50)
     logger.info("Web界面地址: http://localhost:5000")
     logger.info("=" * 50)
+
+    # 启动时自动开启监控（如果配置启用）
+    if movie_manager.enable_monitoring:
+        movie_manager.start_monitoring()
+        logger.info("状态监控已自动启动")
 
     try:
         app.run(debug=True, host='0.0.0.0', port=5000)
@@ -1718,4 +2089,6 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"系统启动失败: {e}")
     finally:
+        # 关闭监控线程
+        movie_manager.stop_monitoring()
         logger.info("影视文件管理系统已关闭")
