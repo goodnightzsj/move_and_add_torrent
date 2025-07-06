@@ -1183,6 +1183,102 @@ tv:
             'unmatched': unmatched
         }
 
+    def preprocess_torrent_name(self, torrent_name: str) -> str:
+        """预处理种子文件名，智能处理中括号和点分割的内容"""
+        try:
+            # 移除文件扩展名
+            name = os.path.splitext(torrent_name)[0]
+            original_name = name
+
+            logger.debug(f"开始预处理种子文件名: {torrent_name}")
+
+            # 智能处理：检查是否有多个中括号
+            bracket_matches = re.findall(r'\[([^\]]+)\]', name)
+            if len(bracket_matches) >= 2:
+                # 如果有多个中括号，通常第一个是发布组，第二个是标题
+                logger.debug(f"发现多个中括号: {bracket_matches}")
+
+                # 移除第一个中括号（发布组）
+                first_bracket = re.search(r'^\[([^\]]+)\]\.?', name)
+                if first_bracket:
+                    name = name[first_bracket.end():].strip()
+                    logger.debug(f"移除第一个中括号后: {name}")
+
+                # 保留后续的中括号内容，它们可能包含重要的标题信息
+                # 不再移除第一个点之前的内容，因为可能是重要的标题部分
+
+            else:
+                # 只有一个或没有中括号的情况，按原逻辑处理
+                bracket_match = re.search(r'^\[([^\]]+)\]\.?', name)
+                if bracket_match:
+                    name = name[bracket_match.end():].strip()
+                    logger.debug(f"移除第一个中括号后: {name}")
+
+                # 如果还有内容，查找第一个点的位置
+                first_dot_pos = name.find('.')
+                if first_dot_pos > 0:
+                    # 检查第一个点之前的内容是否包含中文
+                    before_first_dot = name[:first_dot_pos]
+                    if not re.search(r'[\u4e00-\u9fff]', before_first_dot):
+                        # 如果第一个点之前没有中文，可能是发布组标识，可以移除
+                        after_first_dot = name[first_dot_pos + 1:].strip()
+                        if after_first_dot:
+                            name = after_first_dot
+                            logger.debug(f"移除第一个点之前的内容后: {name}")
+
+            # 如果处理后的名称为空或太短，使用原始文件名
+            if len(name.strip()) < 2:
+                logger.warning(f"预处理后标题太短，使用原始文件名: {original_name}")
+                name = original_name
+
+            logger.info(f"种子文件名预处理完成: '{torrent_name}' -> '{name}'")
+            return name
+
+        except Exception as e:
+            logger.error(f"预处理种子文件名失败: {e}，使用原始文件名")
+            return torrent_name
+
+    def determine_category_for_torrent(self, torrent_info: Dict) -> str:
+        """根据种子信息确定qBittorrent分类"""
+        try:
+            # 获取种子标题（这是简化提取的标题）
+            torrent_title = torrent_info.get('title', '')
+            if not torrent_title:
+                logger.warning("种子标题为空，使用默认分类")
+                return 'movie_manager'
+
+            # 获取原始种子文件名
+            torrent_name = torrent_info.get('name', '')
+            if not torrent_name:
+                logger.warning("种子文件名为空，使用简化标题")
+                search_title = torrent_title
+            else:
+                # 对原始种子文件名进行高级标题提取
+                # 先去掉第一个[]和.之前的内容，然后使用复杂的标题提取规则
+                processed_name = self.preprocess_torrent_name(torrent_name)
+                search_title = self.extract_title_from_filename(processed_name)
+                logger.info(f"种子标题处理: {torrent_name} -> {processed_name} -> {search_title}")
+
+            # 通过TMDB搜索获取内容信息
+            tmdb_results = self.search_tmdb(search_title, 'multi')
+
+            if not tmdb_results:
+                logger.info(f"TMDB未找到匹配结果: {search_title}，使用默认分类")
+                return 'movie_manager'
+
+            # 使用第一个搜索结果
+            tmdb_data = tmdb_results[0]
+
+            # 根据TMDB数据匹配分类
+            category = self.match_category(tmdb_data)
+
+            logger.info(f"种子分类确定: {search_title} -> {category}")
+            return category
+
+        except Exception as e:
+            logger.error(f"确定种子分类失败: {e}，使用默认分类")
+            return 'movie_manager'
+
     def generate_random_tag(self, length: int = 10) -> str:
         """生成随机标签"""
         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -1242,8 +1338,8 @@ tv:
                 self.qb_cookies = response.cookies
                 logger.info("qBittorrent登录成功")
 
-                # 检查并创建分类
-                self.qb_ensure_category()
+                # 检查并创建默认分类
+                self.qb_ensure_category('movie_manager')
 
                 return True
             else:
@@ -1254,8 +1350,8 @@ tv:
             logger.error(f"qBittorrent登录异常: {e}")
             return False
 
-    def qb_ensure_category(self) -> bool:
-        """确保movie_manager分类存在"""
+    def qb_ensure_category(self, category_name: str = 'movie_manager') -> bool:
+        """确保指定分类存在"""
         try:
             # 获取现有分类
             categories_url = f"{self.qb_host}/api/v2/torrents/categories"
@@ -1264,11 +1360,11 @@ tv:
 
             categories = response.json()
 
-            if 'movie_manager' not in categories:
+            if category_name not in categories:
                 # 创建分类
                 create_url = f"{self.qb_host}/api/v2/torrents/createCategory"
                 data = {
-                    'category': 'movie_manager',
+                    'category': category_name,
                     'savePath': ''  # 使用默认路径
                 }
 
@@ -1276,13 +1372,13 @@ tv:
                 response.raise_for_status()
 
                 if response.text == "Ok." or response.status_code == 200:
-                    logger.info("成功创建qBittorrent分类: movie_manager")
+                    logger.info(f"成功创建qBittorrent分类: {category_name}")
                     return True
                 else:
                     logger.warning(f"创建分类失败: {response.text}")
                     return False
             else:
-                logger.debug("qBittorrent分类movie_manager已存在")
+                logger.debug(f"qBittorrent分类{category_name}已存在")
                 return True
 
         except Exception as e:
@@ -1290,12 +1386,14 @@ tv:
             return False
 
     def qb_add_torrent(self, torrent_path: str, download_path: str,
-                      skip_verify: Optional[bool] = None, auto_start: Optional[bool] = None) -> bool:
+                      category: Optional[str] = None, skip_verify: Optional[bool] = None,
+                      auto_start: Optional[bool] = None) -> bool:
         """添加种子到qBittorrent
 
         Args:
             torrent_path: 种子文件路径
             download_path: 下载路径
+            category: qBittorrent分类名称（None时使用默认分类）
             skip_verify: 是否跳过校验（None时使用全局配置）
             auto_start: 是否自动开始（None时使用全局配置）
         """
@@ -1328,15 +1426,25 @@ tv:
             random_tag = self.generate_random_tag()
             tags = f'auto_added,{random_tag}'
 
+            # 确定分类名称
+            qb_category = category if category else 'movie_manager'
+
+            # 确保分类存在
+            if not self.qb_ensure_category(qb_category):
+                logger.warning(f"无法创建分类 {qb_category}，使用默认分类")
+                qb_category = 'movie_manager'
+                self.qb_ensure_category(qb_category)
+
             # 检查下载路径
             logger.debug(f"目标下载路径: {download_path}")
+            logger.debug(f"使用分类: {qb_category}")
             logger.debug(f"校验设置: 跳过校验={skip_verify}, 自动开始={auto_start}")
 
             with open(torrent_path, 'rb') as f:
                 files = {'torrents': f}
                 data = {
                     'savepath': download_path,
-                    'category': 'movie_manager',
+                    'category': qb_category,
                     'tags': tags,
                     'paused': 'true',  # 默认暂停状态
                     'skip_checking': 'true' if skip_verify else 'false'
@@ -1384,7 +1492,7 @@ tv:
                         logger.error(f"  1. 下载路径不存在或无权限: {download_path}")
                         logger.error(f"  2. 种子文件已存在于qBittorrent中")
                         logger.error(f"  3. 种子文件格式错误或损坏")
-                        logger.error(f"  4. qBittorrent分类'movie_manager'不存在")
+                        logger.error(f"  4. qBittorrent分类'{qb_category}'不存在")
                         logger.error(f"  5. 磁盘空间不足")
                     else:
                         logger.error(f"添加种子失败: {error_msg}")
@@ -1900,10 +2008,13 @@ def api_add_torrents():
         logger.info(f"处理种子: {torrent_name} -> {download_path} (策略: {match_type})")
 
         if torrent_path and download_path:
-            success = movie_manager.qb_add_torrent(torrent_path, download_path, skip_verify, auto_start)
+            # 根据种子标题确定分类
+            category = movie_manager.determine_category_for_torrent(torrent_info)
+
+            success = movie_manager.qb_add_torrent(torrent_path, download_path, category, skip_verify, auto_start)
             if success:
                 success_count += 1
-                logger.info(f"种子添加成功: {torrent_name}")
+                logger.info(f"种子添加成功: {torrent_name} (分类: {category})")
             else:
                 error_count += 1
                 logger.error(f"种子添加失败: {torrent_name}")
